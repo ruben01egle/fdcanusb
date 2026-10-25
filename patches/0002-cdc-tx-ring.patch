@@ -1,0 +1,140 @@
+--- a/fw/stm32g4_async_usb_cdc.cc
++++ b/fw/stm32g4_async_usb_cdc.cc
+@@ -41,6 +41,12 @@
+ #define CDC_PROTOCOL USB_PROTO_NONE
+ 
+ namespace {
++// Outgoing CDC data waiting for the IN endpoint.  This is large
++// enough to hold a whole cycle of replies, so writers rarely have to
++// wait on the host.  It lives outside of the pool so that it does
++// not eat into the pool budget.
++constexpr size_t kCdcTxRingSize = 512;
++char g_cdc_tx_ring[kCdcTxRingSize];
+ struct composite_config {
+     struct usb_config_descriptor        config;
+ 
+@@ -446,29 +452,29 @@
+     }
+ 
+     // See if we can fill this now.
+-    if (buffer_.size < CDC_DATA_SZ) {
+-      const auto to_write = std::min(
+-          current_write_data_.size(),
+-          (CDC_DATA_SZ - buffer_.size));
+-      std::memcpy(&buffer_.buf[buffer_.size],
+-                  current_write_data_.data(),
+-                  to_write);
+-      buffer_.size += to_write;
+-
+-      auto copy = current_write_callback_;
+-      current_write_callback_ = {};
+-      current_write_data_ = {};
++    const auto to_write = std::min(
++        current_write_data_.size(), tx_ring_.free());
++    if (to_write == 0) { return; }
+ 
+-      // If the TX endpoint is idle and we now have data, arm it.
+-      if (tx_idle_ && buffer_.size > 0) {
+-        tx_idle_ = false;
+-        last_tx_size_ = buffer_.size;
+-        usbd_ep_write(&udev_, CDC_TXD_EP, &buffer_.buf[0], buffer_.size);
+-        buffer_.size = 0;
+-      }
++    tx_ring_.Push(current_write_data_.data(), to_write);
++
++    auto copy = current_write_callback_;
++    current_write_callback_ = {};
++    current_write_data_ = {};
+ 
+-      copy(micro::error_code(), to_write);
++    // If the TX endpoint is idle and we now have data, arm it.
++    if (tx_idle_) {
++      tx_idle_ = false;
++      SendPacket(CDC_TXD_EP);
+     }
++
++    copy(micro::error_code(), to_write);
++  }
++
++  void SendPacket(uint8_t ep) {
++    const auto size = tx_ring_.Pop(tx_packet_, CDC_DATA_SZ);
++    last_tx_size_ = size;
++    usbd_ep_write(&udev_, ep, tx_packet_, size);
+   }
+ 
+   usbd_respond cdc_setconf(uint8_t cfg) {
+@@ -603,6 +609,7 @@
+     const auto actual = usbd_ep_read(&udev_, ep, &fifo_[fpos_], bytes_to_read);
+     fpos_ += actual;
+ 
++
+     // The host writing to us shows the port is open just as well as
+     // it reading from us does.
+     last_cdc_activity_us_ = options_.timer->read_us();
+@@ -631,12 +638,13 @@
+   void cdc_txonly(uint8_t event, uint8_t ep) {
+     last_cdc_activity_us_ = options_.timer->read_us();
+ 
+-    if (buffer_.size == 0) {
++
++    if (tx_ring_.size == 0) {
+       if (last_tx_size_ == CDC_DATA_SZ) {
+         // The packet just sent was full size, so the host cannot
+         // tell the transfer has ended.  Terminate it with a ZLP.
+         last_tx_size_ = 0;
+-        usbd_ep_write(&udev_, ep, &buffer_.buf[0], 0);
++        usbd_ep_write(&udev_, ep, tx_packet_, 0);
+         return;
+       }
+ 
+@@ -650,9 +658,7 @@
+ 
+     led_com_.write(1);
+ 
+-    last_tx_size_ = buffer_.size;
+-    usbd_ep_write(&udev_, ep, &buffer_.buf[0], buffer_.size);
+-    buffer_.size = 0;
++    SendPacket(ep);
+   }
+ 
+   static usbd_respond g_cdc_setconf (usbd_device *dev, uint8_t cfg) {
+@@ -704,12 +710,36 @@
+   std::string_view current_write_data_;
+   ssize_t current_write_size_ = {};
+ 
+-  struct Buffer {
+-    char buf[CDC_DATA_SZ] = {};
++  struct TxRing {
++    char* const buf = g_cdc_tx_ring;
++    size_t start = 0;
+     size_t size = 0;
++
++    size_t free() const { return kCdcTxRingSize - size; }
++
++    void Push(const char* data, size_t length) {
++      const size_t put = (start + size) % kCdcTxRingSize;
++      const size_t first = std::min(length, kCdcTxRingSize - put);
++      std::memcpy(&buf[put], data, first);
++      std::memcpy(&buf[0], data + first, length - first);
++      size += length;
++    }
++
++    size_t Pop(char* dest, size_t max) {
++      const size_t length = std::min(max, size);
++      const size_t first = std::min(length, kCdcTxRingSize - start);
++      std::memcpy(dest, &buf[start], first);
++      std::memcpy(dest + first, &buf[0], length - first);
++      start = (start + length) % kCdcTxRingSize;
++      size -= length;
++      return length;
++    }
+   };
+ 
+-  Buffer buffer_;
++  TxRing tx_ring_;
++  // The packet being handed to the endpoint, contiguous even when it
++  // wraps around the end of the ring.
++  char tx_packet_[CDC_DATA_SZ] = {};
+   bool tx_idle_ = true;
+   // Size of the packet most recently handed to the TX endpoint.
+   size_t last_tx_size_ = 0;
