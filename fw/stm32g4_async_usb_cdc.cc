@@ -462,6 +462,7 @@ class Stm32G4AsyncUsbCdc::Impl {
       // If the TX endpoint is idle and we now have data, arm it.
       if (tx_idle_ && buffer_.size > 0) {
         tx_idle_ = false;
+        last_tx_size_ = buffer_.size;
         usbd_ep_write(&udev_, CDC_TXD_EP, &buffer_.buf[0], buffer_.size);
         buffer_.size = 0;
       }
@@ -492,6 +493,10 @@ class Stm32G4AsyncUsbCdc::Impl {
         usbd_ep_config(&udev_, CDC_NTF_EP, USB_EPTYPE_INTERRUPT, CDC_NTF_SZ);
         usbd_reg_endpoint(&udev_, CDC_RXD_EP, g_cdc_rxonly);
         usbd_reg_endpoint(&udev_, CDC_TXD_EP, g_cdc_txonly);
+        // The endpoint is busy until this ZLP is collected, so
+        // ProcessWrite must not try to arm it in the meantime.
+        tx_idle_ = false;
+        last_tx_size_ = 0;
         usbd_ep_write(&udev_, CDC_TXD_EP, 0, 0);
 
         // configure gs_usb endpoints
@@ -598,6 +603,10 @@ class Stm32G4AsyncUsbCdc::Impl {
     const auto actual = usbd_ep_read(&udev_, ep, &fifo_[fpos_], bytes_to_read);
     fpos_ += actual;
 
+    // The host writing to us shows the port is open just as well as
+    // it reading from us does.
+    last_cdc_activity_us_ = options_.timer->read_us();
+
     led_com_.write(1);
 
     ProcessRead();
@@ -623,6 +632,14 @@ class Stm32G4AsyncUsbCdc::Impl {
     last_cdc_activity_us_ = options_.timer->read_us();
 
     if (buffer_.size == 0) {
+      if (last_tx_size_ == CDC_DATA_SZ) {
+        // The packet just sent was full size, so the host cannot
+        // tell the transfer has ended.  Terminate it with a ZLP.
+        last_tx_size_ = 0;
+        usbd_ep_write(&udev_, ep, &buffer_.buf[0], 0);
+        return;
+      }
+
       // We have no data to send.  Leave the endpoint in the NAK state
       // so the hardware automatically NAKs IN tokens without
       // generating further callbacks.  ProcessWrite will re-arm the
@@ -633,6 +650,7 @@ class Stm32G4AsyncUsbCdc::Impl {
 
     led_com_.write(1);
 
+    last_tx_size_ = buffer_.size;
     usbd_ep_write(&udev_, ep, &buffer_.buf[0], buffer_.size);
     buffer_.size = 0;
   }
@@ -693,6 +711,8 @@ private:
 
   Buffer buffer_;
   bool tx_idle_ = true;
+  // Size of the packet most recently handed to the TX endpoint.
+  size_t last_tx_size_ = 0;
 
   micro::SizeCallback current_read_callback_;
   mjlib::base::string_span current_read_data_;
